@@ -93,6 +93,11 @@ h3{font-family:var(--head);font-size:17px;margin:0}
 input,select,textarea{width:100%;font:inherit;font-size:17px;padding:12px 14px;border-radius:12px;border:1px solid var(--border);
   background:var(--surface-2);color:var(--text);-webkit-appearance:none;appearance:none}
 input[type=date]{min-height:48px}
+select{min-height:48px;padding-right:40px;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' fill='none' stroke='%23667068' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 14px center}
+.accd{padding:4px 14px}
+.accd summary em{font-style:normal;font-weight:400;color:var(--muted)}
+.accd[open]{padding-bottom:14px}
 textarea{min-height:84px;resize:vertical}
 input:focus,textarea:focus{outline:2px solid var(--orange);outline-offset:0;border-color:transparent}
 input.invalid{border-color:var(--ko);background:var(--ko-soft)}
@@ -211,7 +216,9 @@ const PROMPT_ORIGINAL = `Quiero crear una app o html que pueda abrir directament
 
 [Decisión] Opción 1: Google Sheets + Apps Script. HTML para abrir desde Safari con acceso directo en la pantalla de inicio. Colores del Consorcio de Bomberos de la Provincia de Sevilla (verde Pantone 357 + naranja Pantone 144).
 
-[Cambio] Repostaje en 2 fases: 1) anotar km de uno o varios vehículos (nota para la preautorización del surtidor); 2) tras repostar, importe por vehículo y envío de todas las filas desde la misma pantalla. Un repostaje queda abierto 1 h desde que se anotan los km; si pasa la hora sin enviar (repostaje abortado, p. ej. por emergencia) se borra automáticamente.`;
+[Cambio] Repostaje en 2 fases: 1) anotar km de uno o varios vehículos (nota para la preautorización del surtidor); 2) tras repostar, importe por vehículo y envío de todas las filas desde la misma pantalla. Un repostaje queda abierto 1 h desde que se anotan los km; si pasa la hora sin enviar (repostaje abortado, p. ej. por emergencia) se borra automáticamente.
+
+[Cambio] Hoja central "Control vehicular - Partes de guardia" con pestañas Parques (A Parque), Vehículos (A Matrícula, B Designación, C Parque) y Personal (Nombre, Cargo, Parque; solo en la hoja). Al iniciar la guardia se elige el parque (con parque por defecto en Más) y se cargan sus vehículos; se pueden añadir vehículos accidentales solo para ese día.`;
 
 const KEY = 'pg.state.v1', UKEY = 'pg.upgrades.v1';
 const $ = (s, r = document) => r.querySelector(s);
@@ -221,13 +228,24 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt
 function load(k, def){ try{ const v = localStorage.getItem(k); return v ? JSON.parse(v) : def; }catch(e){ return def; } }
 function store(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); return true; }catch(e){ return false; } }
 
-const DEF = { config:{ vehiculos:[], url:'', token:'', parque:'' }, guardia:null, cola:[], historial:[], ultimoKm:{}, lastSync:null };
+const DEF = { config:{ url:'', token:'', parqueDef:'' }, catalogo:{ parques:[], vehiculos:[], ts:null },
+  guardia:null, cola:[], historial:[], ultimoKm:{}, lastSync:null };
 let S = Object.assign(JSON.parse(JSON.stringify(DEF)), load(KEY, {}));
 S.config = Object.assign({}, DEF.config, S.config);
+S.catalogo = Object.assign({}, DEF.catalogo, S.catalogo);
+// Migración desde la versión con vehículos guardados en el móvil
+if(!S.config.parqueDef && S.config.parque) S.config.parqueDef = S.config.parque;
+if(S.guardia && !S.guardia.vehiculos){
+  const old = S.config.vehiculos || [];
+  S.guardia.vehiculos = Object.keys(S.guardia.inicio).map(id => { const o = old.find(v => v.id === id) || {};
+    return { id, nombre:o.nombre || S.guardia.inicio[id].label, matricula:o.matricula || '', accidental:false }; });
+  S.guardia.parque = S.guardia.parque || S.config.parqueDef || '';
+}
+delete S.config.vehiculos; delete S.config.parque;
 let UP = load(UKEY, []);
 function persist(){ if(!store(KEY, S)) toast('No se pudo guardar en el móvil', 'ko'); }
 
-const draft = { tab:'inicio', editInicio:{}, repVeh:null, masTab:'ajustes', ultimaCerrada:null };
+const draft = { tab:'inicio', editInicio:{}, masTab:'ajustes', ultimaCerrada:null, parque:null, fecha:null, extra:[] };
 let syncing = false, lastErr = '';
 
 /* ---------- Formatos ---------- */
@@ -246,9 +264,15 @@ const fNum = n => n == null ? '—' : String(n).replace('.', ',');
 const fEur = n => { const [e, d] = (Number(n) || 0).toFixed(2).split('.'); return e.replace(/\B(?=(\d{3})+(?!\d))/g, '.') + ',' + d + ' €'; };
 
 /* ---------- Datos ---------- */
-const veh = id => S.config.vehiculos.find(v => v.id === id);
+const normMat = s => String(s || '').toUpperCase().replace(/[\s-]/g, '');
+const catVeh = v => ({ id:'M:' + (normMat(v.matricula) || String(v.designacion).toUpperCase()),
+  nombre:v.designacion || normMat(v.matricula), matricula:normMat(v.matricula), accidental:false });
+const parqueSel = () => draft.parque != null ? draft.parque : (S.config.parqueDef || '');
+const vehDelParque = p => p ? S.catalogo.vehiculos.filter(v => v.parque === p).map(catVeh) : [];
+const vehsInicio = () => S.guardia ? S.guardia.vehiculos : vehDelParque(parqueSel()).concat(draft.extra);
+const veh = id => vehsInicio().find(v => v.id === id) || null;
 const vLabel = v => v.nombre + (v.matricula ? ` (${v.matricula})` : '');
-const labelOf = id => { const v = veh(id); if(v) return vLabel(v); const i = S.guardia && S.guardia.inicio[id]; return i ? i.label : id; };
+const isAcc = id => { const v = veh(id); return !!(v && v.accidental); };
 function kmRef(id, g = S.guardia){
   let m = null; const up = k => { if(k != null && (m == null || k > m)) m = k; };
   if(g){ g.inicio[id] && up(g.inicio[id].km); g.repostajes.filter(r => r.vid === id).forEach(r => up(r.km));
@@ -258,45 +282,72 @@ function kmRef(id, g = S.guardia){
 }
 function evento(tipo, label, extra, gid){
   S.cola.push(Object.assign({ uid:uid(), guardia:gid, tipo, vehiculo:label, fechaHora:ahora(),
-    ts:new Date().toISOString(), parque:S.config.parque || '' }, extra));
+    ts:new Date().toISOString(), parque:(S.guardia && S.guardia.parque) || '' }, extra));
 }
 
 /* ---------- Piezas UI ---------- */
 const head = (t, s) => `<div class="sec-head"><h2>${t}</h2>${s ? `<p class="lead">${s}</p>` : ''}</div>`;
 const badgeOp = op => `<span class="badge ${op ? 'ok' : 'ko'}">${op ? 'Operativo' : 'No operativo'}</span>`;
 const vHead = (name, plate, right = '') => `<div class="veh-head"><div><div class="veh-name">${esc(name)}</div>${plate ? `<div class="plate">${esc(plate)}</div>` : ''}</div>${right}</div>`;
-const emptyVeh = () => `<div class="card empty"><h3>Aún no hay vehículos</h3><p>Da de alta los vehículos del parque una sola vez.</p><button class="btn green" data-act="go" data-tab="mas">Añadir vehículos</button></div>`;
+const noCatalogo = () => `<div class="card empty"><h3>Faltan los datos del Consorcio</h3><p>${S.config.url ? 'No hay parques cargados. Rellena las pestañas Parques y Vehículos de la hoja y pulsa Actualizar.' : 'Conecta primero la app con la hoja de Google.'}</p>
+  <button class="btn green" data-act="${S.config.url ? 'cat-load' : 'go'}" data-tab="mas">${S.config.url ? 'Actualizar desde Google' : 'Ir a Ajustes'}</button></div>`;
+const accForm = () => `<details class="card addveh accd"><summary>+ Vehículo accidental <em>(solo esta guardia)</em></summary>
+  <div class="grid2"><label class="field"><span>Designación</span><input id="a-nom" autocomplete="off" autocapitalize="characters" placeholder="BUP-1"></label>
+  <label class="field"><span>Matrícula <em>(opc.)</em></span><input id="a-mat" autocomplete="off" autocapitalize="characters" placeholder="1234ABC"></label></div>
+  <div class="row-btns"><button class="btn sec" data-act="add-acc">Añadir</button></div></details>`;
 const needInicio = () => `<div class="card empty"><h3>No hay guardia abierta</h3><p>Registra primero el inicio de guardia.</p><button class="btn green" data-act="go" data-tab="inicio">Ir a Inicio</button></div>`;
 
 /* ---------- INICIO ---------- */
 function renderInicio(){
-  const el = $('#tab-inicio'), vs = S.config.vehiculos, g = S.guardia;
-  let h = head('Inicio de guardia', g ? `Guardia abierta · ${fFecha(g.id)}` : 'Estado de los vehículos en parque y km al relevo.');
-  if(!vs.length){ el.innerHTML = h + emptyVeh(); return; }
-  const n = g ? Object.keys(g.inicio).length : 0;
-  h += `<div class="card"><label class="field" style="margin:0"><span>Fecha de la guardia</span>
-        <input type="date" id="g-fecha" value="${g ? g.id : hoyISO()}" ${n ? 'disabled' : ''}></label>
-        ${n ? '' : '<p class="hint">Si la guardia empezó ayer, cambia la fecha antes de registrar.</p>'}</div>`;
+  const el = $('#tab-inicio'), g = S.guardia;
+  let h = head('Inicio de guardia', g ? `Guardia abierta · ${fFecha(g.id)}${g.parque ? ' · ' + esc(g.parque) : ''}` : 'Parque, estado de los vehículos y km al relevo.');
+  if(!g){
+    const ps = S.catalogo.parques, p = parqueSel();
+    if(!ps.length && !draft.extra.length){ el.innerHTML = h + noCatalogo() + accForm(); return; }
+    const nv = vehDelParque(p).length;
+    h += `<div class="card"><label class="field" style="margin:0"><span>Parque de la guardia</span>
+        <select id="g-parque">${p && ps.includes(p) ? '' : '<option value="">Elige parque…</option>'}${ps.map(x => `<option ${x === p ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select></label>
+      <label class="field"><span>Fecha de la guardia</span><input type="date" id="g-fecha" value="${draft.fecha || hoyISO()}"></label>
+      <p class="hint">${p ? `${nv} vehículo${nv === 1 ? '' : 's'} asignado${nv === 1 ? '' : 's'} a ${esc(p)}.` : 'Elige el parque para cargar sus vehículos.'} Si la guardia empezó ayer, cambia la fecha.</p></div>`;
+  }
+  const vs = vehsInicio(), n = g ? Object.keys(g.inicio).length : 0;
   let forms = 0;
   vs.forEach(v => {
     const r = g && g.inicio[v.id];
+    const plate = [v.matricula, v.accidental ? 'ACCIDENTAL' : ''].filter(Boolean).join(' · ');
     if(r && !draft.editInicio[v.id]){
-      h += `<div class="card done ${r.operativo ? '' : 'ko'}">${vHead(v.nombre, v.matricula, badgeOp(r.operativo))}
+      h += `<div class="card done ${r.operativo ? '' : 'ko'}">${vHead(v.nombre, plate, badgeOp(r.operativo))}
         <div class="stats"><div><small>Km inicio</small><b>${fKm(r.km)}</b></div><div><small>Registrado</small><b>${hora(r.ts)}</b></div></div>
         ${r.obs ? `<p class="obs">${esc(r.obs)}</p>` : ''}
         <button class="link" data-act="corr-ini" data-id="${v.id}">Corregir</button></div>`;
     } else {
       forms++;
       const op = r ? r.operativo : true, ult = S.ultimoKm[v.id];
-      h += `<div class="card veh-form" data-id="${v.id}" data-op="${op ? 1 : 0}">${vHead(v.nombre, v.matricula, r ? '<span class="badge warn">Corrigiendo</span>' : '')}
+      const right = r ? '<span class="badge warn">Corrigiendo</span>' : v.accidental ? `<button class="icon-btn" data-act="rm-acc" data-id="${v.id}" aria-label="Quitar">✕</button>` : '';
+      h += `<div class="card veh-form" data-id="${v.id}" data-op="${op ? 1 : 0}">${vHead(v.nombre, plate, right)}
         <div class="seg"><button type="button" data-act="op" data-v="1" class="${op ? 'on-ok' : ''}">Operativo</button><button type="button" data-act="op" data-v="0" class="${op ? '' : 'on-ko'}">No operativo</button></div>
         <label class="field"><span>Km actuales</span><input name="km" inputmode="numeric" pattern="[0-9]*" autocomplete="off" value="${r && r.km != null ? r.km : ''}" placeholder="${ult != null ? 'Último: ' + fKm(ult) : 'Ej. 45120'}"></label>
         <label class="field"><span>Observaciones <em>(opcional)</em></span><input name="obs" autocomplete="off" value="${esc(r ? r.obs : '')}" placeholder="Avería, incidencia, nivel…"></label></div>`;
     }
   });
+  h += accForm();
   if(forms) h += `<button class="btn" data-act="save-ini">${n ? 'Guardar' : 'Registrar inicio de guardia'}</button>`;
-  else h += `<div class="note ok">✓ Inicio registrado. Siguiente: <a href="#" data-act="go" data-tab="repostaje">Repostaje</a> o <a href="#" data-act="go" data-tab="final">Final de guardia</a>.</div>`;
+  else if(n) h += `<div class="note ok">✓ Inicio registrado. Siguiente: <a href="#" data-act="go" data-tab="repostaje">Repostaje</a> o <a href="#" data-act="go" data-tab="final">Final de guardia</a>.</div>`;
   el.innerHTML = h;
+}
+function addAccidental(){
+  const nom = $('#a-nom').value.trim().toUpperCase(), mat = normMat($('#a-mat').value);
+  if(!nom){ $('#a-nom').classList.add('invalid'); toast('Pon la designación del vehículo', 'ko'); return; }
+  const v = { id:'A:' + uid(), nombre:nom, matricula:mat, accidental:true };
+  if(mat){ const prev = Object.keys(S.ultimoKm).find(k => k === 'M:' + mat); if(prev) v.id = prev; } // reutiliza el histórico de km si existe
+  if(vehsInicio().some(x => x.id === v.id)){ toast('Ese vehículo ya está en la lista', 'ko'); return; }
+  (S.guardia ? S.guardia.vehiculos : draft.extra).push(v);
+  persist(); renderInicio(); toast(`${nom} añadido solo para esta guardia`, 'ok');
+}
+function rmAccidental(id){
+  if(S.guardia){ if(S.guardia.inicio[id]) return; S.guardia.vehiculos = S.guardia.vehiculos.filter(v => v.id !== id); persist(); }
+  else draft.extra = draft.extra.filter(v => v.id !== id);
+  renderInicio();
 }
 function saveInicio(){
   const rows = []; let err = 0;
@@ -306,15 +357,21 @@ function saveInicio(){
     rows.push({ v, op, km, obs: $('[name=obs]', f).value.trim() });
   });
   if(err){ toast('Indica los km de los vehículos operativos', 'ko'); return; }
-  const g0 = S.guardia;
+  const g0 = S.guardia, pq = g0 ? g0.parque : parqueSel();
+  if(!g0 && S.catalogo.parques.length && !pq){ toast('Elige el parque de la guardia', 'ko'); return; }
+  if(!rows.length){ toast('No hay vehículos en la lista', 'ko'); return; }
   const bajos = rows.filter(r => !(g0 && g0.inicio[r.v.id]) && r.km != null && S.ultimoKm[r.v.id] != null && r.km < S.ultimoKm[r.v.id]);
   if(bajos.length && !confirm('Km menores que el último registrado:\n' + bajos.map(r => `${r.v.nombre}: ${fKm(r.km)} (último ${fKm(S.ultimoKm[r.v.id])})`).join('\n') + '\n\n¿Continuar?')) return;
-  if(!S.guardia) S.guardia = { id: $('#g-fecha').value || hoyISO(), inicio:{}, repostajes:[], final:{} };
+  if(!S.guardia){
+    S.guardia = { id: $('#g-fecha').value || hoyISO(), parque:pq, vehiculos:vehsInicio().map(v => Object.assign({}, v)),
+      inicio:{}, repostajes:[], final:{}, tandas:[] };
+    draft.extra = []; draft.parque = null; draft.fecha = null;
+  }
   const g = S.guardia;
   rows.forEach(r => {
     const corr = !!g.inicio[r.v.id], label = vLabel(r.v);
     g.inicio[r.v.id] = { operativo:r.op, km:r.km, obs:r.obs, ts:Date.now(), label };
-    evento(corr ? 'INICIO (corrección)' : 'INICIO', label, { operativo:r.op, km:r.km, obs:r.obs }, g.id);
+    evento(corr ? 'INICIO (corrección)' : 'INICIO', label, { operativo:r.op, km:r.km, obs:r.obs, accidental:!!r.v.accidental }, g.id);
     if(r.km != null) S.ultimoKm[r.v.id] = r.km;
     delete draft.editInicio[r.v.id];
   });
@@ -367,9 +424,8 @@ function tandaCard(g, t, active){
   </div>`;
 }
 function renderRepostaje(){
-  const el = $('#tab-repostaje'), g = S.guardia, vs = S.config.vehiculos;
-  let h = head('Repostaje', g ? `Guardia · ${fFecha(g.id)}` : '');
-  if(!vs.length){ el.innerHTML = h + emptyVeh(); return; }
+  const el = $('#tab-repostaje'), g = S.guardia;
+  let h = head('Repostaje', g ? `Guardia · ${fFecha(g.id)}${g.parque ? ' · ' + esc(g.parque) : ''}` : '');
   if(!g){ el.innerHTML = h + needInicio(); return; }
   g.tandas = g.tandas || [];
   purgeTandas(g);
@@ -436,7 +492,7 @@ function tandaSend(t){
   t.items.forEach(x => {
     const obs = 'Km tomados ' + hora(x.ts);
     g.repostajes.push({ uid:uid(), vid:x.vid, label:x.label, importe:x.importe, litros:x.litros ?? null, km:x.km, obs, ts:now });
-    evento('REPOSTAJE', x.label, { importe:x.importe, litros:x.litros ?? null, km:x.km, obs }, g.id);
+    evento('REPOSTAJE', x.label, { importe:x.importe, litros:x.litros ?? null, km:x.km, obs, accidental:isAcc(x.vid) }, g.id);
     if(S.ultimoKm[x.vid] == null || x.km > S.ultimoKm[x.vid]) S.ultimoKm[x.vid] = x.km;
   });
   const tot = t.items.reduce((a, x) => a + x.importe, 0);
@@ -502,7 +558,7 @@ function closeGuardia(){
   rows.forEach(r => {
     const rec = r.km != null && r.ini != null ? r.km - r.ini : null;
     g.final[r.id] = { km:r.km, recorridos:rec, ts:Date.now() };
-    evento('FINAL', g.inicio[r.id].label, { km:r.km, recorridos:rec }, g.id);
+    evento('FINAL', g.inicio[r.id].label, { km:r.km, recorridos:rec, accidental:isAcc(r.id) }, g.id);
     if(r.km != null) S.ultimoKm[r.id] = r.km;
   });
   g.cerrada = Date.now();
@@ -515,7 +571,7 @@ function closeGuardia(){
 function buildTxt(g){
   const L = [], ids = Object.keys(g.inicio);
   L.push('PARTE DE GUARDIA · ' + fFecha(g.id));
-  if(S.config.parque) L.push('Parque: ' + S.config.parque);
+  if(g.parque) L.push('Parque: ' + g.parque);
   L.push('Generado en el móvil: ' + ahora(), '============================================', '', 'INICIO DE GUARDIA');
   if(!ids.length) L.push('  (sin registros)');
   ids.forEach(id => { const i = g.inicio[id];
@@ -563,14 +619,16 @@ function renderMas(){
   if(t === 'ajustes'){
     const c = S.config;
     h += `<div class="card" id="sync-card">${syncCardHTML()}</div>`;
-    h += `<div class="card"><h3>Vehículos</h3>
-      ${c.vehiculos.length ? `<div class="list" style="padding:4px 0">${c.vehiculos.map(v => `<div class="lrow"><div><b>${esc(v.nombre)}</b>${v.matricula ? `<small>${esc(v.matricula)}</small>` : ''}</div>
-        <button class="icon-btn" data-act="del-veh" data-id="${v.id}" aria-label="Eliminar"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg></button></div>`).join('')}</div>` : '<p class="hint">Añade los vehículos que entran en tu guardia.</p>'}
-      <div class="grid2"><label class="field"><span>Indicativo</span><input id="v-nom" autocomplete="off" autocapitalize="characters" placeholder="BUP-1"></label>
-      <label class="field"><span>Matrícula <em>(opc.)</em></span><input id="v-mat" autocomplete="off" autocapitalize="characters" placeholder="1234ABC"></label></div>
-      <div class="row-btns"><button class="btn sec" data-act="add-veh">Añadir vehículo</button></div></div>`;
+    const cat = S.catalogo, pd = c.parqueDef, vpd = vehDelParque(pd);
+    h += `<div class="card"><div class="veh-head"><div><h3>Parques y vehículos</h3>
+        <p class="hint">${cat.ts ? `${cat.parques.length} parques · ${cat.vehiculos.length} vehículos · actualizado ${new Date(cat.ts).toLocaleDateString('es-ES')} ${hora(cat.ts)}` : 'Aún no se han cargado desde la hoja.'}</p></div>
+        <button class="btn green sm" data-act="cat-load">Actualizar</button></div>
+      <label class="field"><span>Parque por defecto</span>
+        <select id="c-parquedef"><option value="">— Ninguno —</option>${cat.parques.map(x => `<option ${x === pd ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select></label>
+      ${pd ? `<div class="list" style="padding:4px 0">${vpd.length ? vpd.map(v => `<div class="lrow"><div><b>${esc(v.nombre)}</b>${v.matricula ? `<small>${esc(v.matricula)}</small>` : ''}</div></div>`).join('')
+        : '<p class="hint">Este parque no tiene vehículos asignados en la hoja.</p>'}</div>` : ''}
+      <p class="hint">Los parques, vehículos y personal se editan en la hoja de Google (pestañas Parques, Vehículos y Personal).</p></div>`;
     h += `<div class="card"><h3>Conexión con Google Sheets</h3>
-      <label class="field"><span>Parque <em>(opc.)</em></span><input id="c-parque" autocomplete="off" value="${esc(c.parque)}" placeholder="Nombre del parque"></label>
       <label class="field"><span>URL de la aplicación web (/exec)</span><input id="c-url" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" value="${esc(c.url)}" placeholder="https://script.google.com/macros/s/…/exec"></label>
       <label class="field"><span>Token</span><input id="c-token" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" value="${esc(c.token)}" placeholder="El mismo que en Code.gs"></label>
       <div class="row-btns"><button class="btn green" data-act="save-cfg">Guardar</button><button class="btn sec" data-act="test">Probar</button></div></div>`;
@@ -631,12 +689,35 @@ async function testConn(){
   try{
     const r = await fetch(url + (url.includes('?') ? '&' : '?') + 'action=ping&token=' + encodeURIComponent(token));
     const j = await r.json();
-    if(j.ok){ toast(`Conectado con «${j.hoja}»`, 'ok'); lastErr = ''; sync(); }
+    if(j.ok){ toast(`Conectado con «${j.hoja}»`, 'ok'); lastErr = ''; sync(); loadCatalogo(true); }
     else toast(j.error || 'Respuesta no válida', 'ko');
   }catch(e){ toast('No conecta. Revisa la URL y que el acceso sea "Cualquier usuario"', 'ko'); }
 }
+let catLoading = false;
+async function loadCatalogo(manual){
+  const { url, token } = S.config;
+  if(!url){ if(manual) toast('Configura primero la URL de Google', 'ko'); return; }
+  if(catLoading || !navigator.onLine){ if(manual && !navigator.onLine) toast('Sin cobertura', 'ko'); return; }
+  catLoading = true;
+  try{
+    const r = await fetch(url + (url.includes('?') ? '&' : '?') + 'action=catalogo&token=' + encodeURIComponent(token));
+    const j = await r.json();
+    if(!j.ok) throw new Error(j.error || 'respuesta no válida');
+    if(!Array.isArray(j.parques)) throw new Error('actualiza Code.gs a la última versión');
+    const antes = JSON.stringify([S.catalogo.parques, S.catalogo.vehiculos]);
+    S.catalogo = { parques:j.parques, vehiculos:j.vehiculos || [], ts:Date.now() };
+    if(!S.config.parqueDef && j.parques.length === 1) S.config.parqueDef = j.parques[0];
+    persist();
+    if(manual) toast(`${j.parques.length} parques · ${S.catalogo.vehiculos.length} vehículos cargados`, 'ok');
+    if(manual || antes !== JSON.stringify([S.catalogo.parques, S.catalogo.vehiculos])){
+      const f = document.activeElement;
+      if(!S.guardia && !(f && f.closest && f.closest('#tab-inicio') && f.tagName === 'INPUT')) renderInicio();
+      renderMas();
+    }
+  }catch(e){ if(manual) toast('No se pudieron cargar los datos: ' + e.message, 'ko'); }
+  catLoading = false;
+}
 function saveCfg(silent){
-  S.config.parque = $('#c-parque').value.trim();
   S.config.url = $('#c-url').value.trim();
   S.config.token = $('#c-token').value.trim();
   persist(); renderStatus(); if(!silent){ toast('Ajustes guardados', 'ok'); sync(); }
@@ -685,13 +766,9 @@ document.addEventListener('click', e => {
       if(confirm('Se borrará del móvil la guardia en curso. Lo ya enviado a Google Sheets se mantiene. ¿Continuar?')){
         S.guardia = null; draft.editInicio = {}; persist(); renderAll(); toast('Guardia descartada'); } break;
     case 'mas-tab': draft.masTab = b.dataset.t; renderMas(); break;
-    case 'add-veh': {
-      const nom = $('#v-nom').value.trim().toUpperCase(), mat = $('#v-mat').value.trim().toUpperCase().replace(/\s/g, '');
-      if(!nom){ $('#v-nom').classList.add('invalid'); toast('Pon el indicativo del vehículo', 'ko'); return; }
-      S.config.vehiculos.push({ id:uid(), nombre:nom, matricula:mat }); persist(); renderAll(); toast(`${nom} añadido`, 'ok'); break; }
-    case 'del-veh': { const v = veh(b.dataset.id);
-      if(confirm(`¿Eliminar ${v.nombre} de la lista?` + (S.guardia && S.guardia.inicio[v.id] ? '\nSus registros de la guardia en curso se conservan.' : ''))){
-        S.config.vehiculos = S.config.vehiculos.filter(x => x.id !== v.id); persist(); renderAll(); } break; }
+    case 'cat-load': loadCatalogo(true); break;
+    case 'add-acc': addAccidental(); break;
+    case 'rm-acc': rmAccidental(b.dataset.id); break;
     case 'save-cfg': saveCfg(); break;
     case 'test': testConn(); break;
     case 'sync': sync(true); break;
@@ -710,16 +787,23 @@ document.addEventListener('input', e => {
   const f = e.target.closest('.fin-form'); if(f) updateRec(f);
   if(e.target.closest('.titem')) tandaInput(e.target);
 });
+document.addEventListener('change', e => {
+  const id = e.target.id;
+  if(id === 'g-parque'){ draft.parque = e.target.value; draft.fecha = $('#g-fecha').value; renderInicio(); }
+  if(id === 'g-fecha') draft.fecha = e.target.value;
+  if(id === 'c-parquedef'){ S.config.parqueDef = e.target.value; draft.parque = null; persist(); renderMas(); if(!S.guardia) renderInicio(); toast('Parque por defecto guardado', 'ok'); }
+});
 setInterval(tickTandas, 30000);
 window.addEventListener('online', () => sync());
 window.addEventListener('offline', renderStatus);
-document.addEventListener('visibilitychange', () => { if(document.visibilityState === 'visible'){ tickTandas(); sync(); } });
+document.addEventListener('visibilitychange', () => { if(document.visibilityState === 'visible'){ tickTandas(); sync(); if(!S.guardia) loadCatalogo(); } });
 setInterval(() => { if(S.cola.length) sync(); }, 60000);
 
 renderAll();
-if(!S.config.vehiculos.length){ draft.masTab = 'ajustes'; renderMas(); }
+if(!S.config.url){ draft.masTab = 'ajustes'; renderMas(); go('mas'); }
 else if(S.guardia && Object.keys(S.guardia.inicio).length) go('repostaje');
 sync();
+loadCatalogo();
 </script>
 </body>
 </html>

@@ -133,6 +133,26 @@ input:disabled{opacity:.6}
 .icon-btn{border:0;background:var(--surface-2);border-radius:10px;width:40px;height:40px;display:grid;place-items:center;color:var(--muted);flex:none}
 .footer{text-align:center;color:var(--muted);font-size:12px;margin-top:22px;font-family:ui-monospace,"SF Mono",Menlo,monospace;letter-spacing:.04em}
 
+/* Repostaje en 2 fases */
+.card.tanda{border-left:4px solid var(--orange)}
+.step{display:flex;align-items:center;gap:10px;margin:16px 0 8px}
+.step .num{width:24px;height:24px;border-radius:50%;background:var(--green);color:#fff;display:grid;place-items:center;font-family:var(--head);font-weight:700;font-size:13px;flex:none}
+.nota{display:flex;align-items:center;justify-content:space-between;gap:10px;background:var(--warn-soft);border-radius:12px;padding:10px 12px}
+.nota pre{margin:0;font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:14px;white-space:pre-wrap;word-break:break-word;min-width:0}
+.krow{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--border)}
+.krow:last-of-type{border-bottom:0}
+.krow span{min-width:0}
+.krow small{display:block;color:var(--muted);font-size:12px}
+.krow input{width:132px;flex:none;text-align:right}
+.addveh{margin-top:10px}
+.addveh summary{color:var(--accent);font-weight:600;padding:8px 0;cursor:pointer}
+.titem{padding:10px 0;border-bottom:1px solid var(--border)}
+.titem .field{margin-top:8px}
+.grid3{display:grid;grid-template-columns:1.1fr 1fr .8fr;gap:8px}
+.grid3 input{padding:11px 10px;font-size:16px}
+.ttotal{display:flex;justify-content:space-between;align-items:baseline;margin:12px 2px 14px;color:var(--muted);font-weight:600}
+.ttotal b{font-family:var(--head);font-size:22px;color:var(--text)}
+
 /* Bottom nav */
 .nav{position:fixed;left:0;right:0;bottom:0;z-index:20;background:var(--surface);border-top:1px solid var(--border);
   display:grid;grid-template-columns:repeat(4,1fr);padding:6px 6px calc(6px + env(safe-area-inset-bottom))}
@@ -189,7 +209,9 @@ input:disabled{opacity:.6}
 const VERSION = '20261015';
 const PROMPT_ORIGINAL = `Quiero crear una app o html que pueda abrir directamente desde el movil, y tendra tres tabs. Una sera Inicio de guardia, en la que indico si el / los vehiculos que demos de alta esta operativo en parque y los km que tiene. La segun tab es al de repostaje, en la que indico el vehiculo repostado , importe y km en el momento del repostaje y la tercera tab es final de guardia que introduzco los km finales. Esto podria ser que al insertar los valores, haga una llamada a actualizar por ejemplo un documento .txt que tenga en mega, para mas tarde cuando actualizo el parte de guardia diario, tener el txt de consulta.
 
-[Decisión] Opción 1: Google Sheets + Apps Script. HTML para abrir desde Safari con acceso directo en la pantalla de inicio. Colores del Consorcio de Bomberos de la Provincia de Sevilla (verde Pantone 357 + naranja Pantone 144).`;
+[Decisión] Opción 1: Google Sheets + Apps Script. HTML para abrir desde Safari con acceso directo en la pantalla de inicio. Colores del Consorcio de Bomberos de la Provincia de Sevilla (verde Pantone 357 + naranja Pantone 144).
+
+[Cambio] Repostaje en 2 fases: 1) anotar km de uno o varios vehículos (nota para la preautorización del surtidor); 2) tras repostar, importe por vehículo y envío de todas las filas desde la misma pantalla. Un repostaje queda abierto 1 h desde que se anotan los km; si pasa la hora sin enviar (repostaje abortado, p. ej. por emergencia) se borra automáticamente.`;
 
 const KEY = 'pg.state.v1', UKEY = 'pg.upgrades.v1';
 const $ = (s, r = document) => r.querySelector(s);
@@ -229,7 +251,8 @@ const vLabel = v => v.nombre + (v.matricula ? ` (${v.matricula})` : '');
 const labelOf = id => { const v = veh(id); if(v) return vLabel(v); const i = S.guardia && S.guardia.inicio[id]; return i ? i.label : id; };
 function kmRef(id, g = S.guardia){
   let m = null; const up = k => { if(k != null && (m == null || k > m)) m = k; };
-  if(g){ g.inicio[id] && up(g.inicio[id].km); g.repostajes.filter(r => r.vid === id).forEach(r => up(r.km)); }
+  if(g){ g.inicio[id] && up(g.inicio[id].km); g.repostajes.filter(r => r.vid === id).forEach(r => up(r.km));
+    (g.tandas || []).forEach(t => t.items.filter(x => x.vid === id).forEach(x => up(x.km))); }
   if(m == null) up(S.ultimoKm[id]);
   return m;
 }
@@ -298,21 +321,67 @@ function saveInicio(){
   persist(); renderAll(); toast('Inicio de guardia registrado', 'ok'); sync();
 }
 
-/* ---------- REPOSTAJE ---------- */
+/* ---------- REPOSTAJE (2 fases: km → preautorización → importe) ---------- */
+const TTL = 60 * 60 * 1000; // 1 h: pasado ese tiempo, nuevos km abren un repostaje nuevo
+// Pasada 1 h sin enviar, el repostaje se da por abortado (p. ej. salida a emergencia) y se borra.
+function purgeTandas(g){
+  if(!g || !g.tandas) return 0;
+  const n = g.tandas.length;
+  g.tandas = g.tandas.filter(t => Date.now() - t.ts < TTL);
+  const borrados = n - g.tandas.length;
+  if(borrados){ persist(); toast(`Repostaje sin importe caducado (más de 1 h) · borrado`); }
+  return borrados;
+}
+const openTandas = g => (g && g.tandas || []).filter(t => Date.now() - t.ts < TTL);
+const activeTanda = g => openTandas(g)[0] || null;
+const notaText = t => t.items.map(i => `${i.label} · ${fKm(i.km)} km`).join('\n');
+const minsLeft = t => Math.max(1, Math.ceil((TTL - (Date.now() - t.ts)) / 60000));
+function tandaBadge(t){
+  return `<span class="badge ${minsLeft(t) <= 10 ? 'ko' : 'warn'}" data-tbadge="${t.id}">Se borra en ${minsLeft(t)} min</span>`;
+}
+function kmRows(g, ids, cls){
+  return ids.map(id => { const i = g.inicio[id], ref = kmRef(id);
+    return `<label class="krow"><span><b>${esc(i.label)}</b><small>${i.operativo ? (ref != null ? 'Último: ' + fKm(ref) : '') : 'No operativo'}</small></span>
+      <input class="${cls}" data-vid="${id}" inputmode="numeric" pattern="[0-9]*" autocomplete="off" placeholder="Km"></label>`; }).join('');
+}
+function tandaCard(g, t, active){
+  const fuera = Object.keys(g.inicio).filter(id => !t.items.some(x => x.vid === id));
+  const tot = t.items.reduce((a, x) => a + (x.importe || 0), 0);
+  return `<div class="card tanda" data-tid="${t.id}">
+    <div class="veh-head"><div><div class="veh-name">Repostaje · ${hora(t.ts)}</div><div class="plate">${t.items.length} vehículo${t.items.length > 1 ? 's' : ''}</div></div>${tandaBadge(t)}</div>
+    <div class="step"><span class="num">1</span><h3>Nota para la preautorización</h3></div>
+    <div class="nota"><pre>${esc(notaText(t))}</pre><button class="btn sec sm" data-act="copy-nota">Copiar</button></div>
+    ${active && fuera.length ? `<details class="addveh"><summary>+ Añadir otro vehículo</summary>${kmRows(g, fuera, 'km-add')}
+      <button class="btn sec" data-act="tanda-add" style="margin-top:10px">Añadir a este repostaje</button></details>` : ''}
+    <div class="step"><span class="num">2</span><h3>Importe tras repostar</h3></div>
+    ${t.items.map(x => `<div class="titem" data-vid="${x.vid}">
+      <div class="veh-head"><b>${esc(x.label)}</b><button class="icon-btn" data-act="tanda-rm" aria-label="Quitar">✕</button></div>
+      <div class="grid3">
+        <label class="field"><span>Km</span><input class="t-km" inputmode="numeric" pattern="[0-9]*" autocomplete="off" value="${x.km ?? ''}"></label>
+        <label class="field"><span>Importe €</span><input class="t-imp" inputmode="decimal" autocomplete="off" placeholder="0,00" value="${x.impTxt ?? ''}"></label>
+        <label class="field"><span>Litros</span><input class="t-lit" inputmode="decimal" autocomplete="off" placeholder="opc." value="${x.litTxt ?? ''}"></label>
+      </div></div>`).join('')}
+    <div class="ttotal">Total <b class="t-total">${fEur(tot)}</b></div>
+    <button class="btn" data-act="tanda-send">Enviar repostaje</button>
+    <button class="link" data-act="tanda-discard" style="color:var(--ko)">Descartar este repostaje</button>
+  </div>`;
+}
 function renderRepostaje(){
   const el = $('#tab-repostaje'), g = S.guardia, vs = S.config.vehiculos;
   let h = head('Repostaje', g ? `Guardia · ${fFecha(g.id)}` : '');
   if(!vs.length){ el.innerHTML = h + emptyVeh(); return; }
   if(!g){ el.innerHTML = h + needInicio(); return; }
-  if(!draft.repVeh || !veh(draft.repVeh)) draft.repVeh = vs.length === 1 ? vs[0].id : null;
-  const sel = draft.repVeh, ref = sel ? kmRef(sel) : null;
-  h += `<div class="card"><span class="label">Vehículo</span>
-    <div class="chips">${vs.map(v => `<button type="button" class="chip ${v.id === sel ? 'on' : ''}" data-act="rep-veh" data-id="${v.id}">${esc(v.nombre)}</button>`).join('')}</div>
-    <div class="grid2"><label class="field"><span>Importe (€)</span><input id="r-imp" inputmode="decimal" autocomplete="off" placeholder="0,00"></label>
-    <label class="field"><span>Litros <em>(opc.)</em></span><input id="r-lit" inputmode="decimal" autocomplete="off" placeholder="0,0"></label></div>
-    <label class="field"><span>Km en el repostaje</span><input id="r-km" inputmode="numeric" pattern="[0-9]*" autocomplete="off" placeholder="${ref != null ? 'Último: ' + fKm(ref) : 'Km'}"></label>
-    <label class="field"><span>Observaciones <em>(opc.)</em></span><input id="r-obs" autocomplete="off" placeholder="Gasolinera, nº de ticket…"></label>
-    <div style="margin-top:16px"><button class="btn" data-act="save-rep">Registrar repostaje</button></div></div>`;
+  g.tandas = g.tandas || [];
+  purgeTandas(g);
+  const act = activeTanda(g);
+  draft.activeTid = act ? act.id : null;
+  if(act) h += tandaCard(g, act, true);
+  if(!act){
+    h += `<div class="card"><div class="step" style="margin-top:0"><span class="num">1</span><div><h3>Km para preautorizar</h3>
+      <p class="hint" style="margin:0">Rellena solo los vehículos que vais a repostar.</p></div></div>
+      ${kmRows(g, Object.keys(g.inicio), 'km-new')}
+      <button class="btn" data-act="tanda-new" style="margin-top:14px">Guardar km</button></div>`;
+  }
   const reps = g.repostajes;
   if(reps.length){
     const tot = reps.reduce((a, r) => a + (r.importe || 0), 0);
@@ -321,20 +390,72 @@ function renderRepostaje(){
   }
   el.innerHTML = h;
 }
-function saveRepostaje(){
-  const g = S.guardia, v = veh(draft.repVeh);
-  if(!v){ toast('Elige el vehículo', 'ko'); return; }
-  const iImp = $('#r-imp'), iKm = $('#r-km');
-  const importe = parseDec(iImp.value), litros = parseDec($('#r-lit').value), km = parseKm(iKm.value), obs = $('#r-obs').value.trim();
-  iImp.classList.toggle('invalid', !(importe > 0)); iKm.classList.toggle('invalid', km == null);
-  if(!(importe > 0) || km == null){ toast('Faltan importe o km', 'ko'); return; }
-  const ini = g.inicio[v.id] && g.inicio[v.id].km;
-  if(ini != null && km < ini && !confirm(`Los km (${fKm(km)}) son menores que los de inicio (${fKm(ini)}). ¿Registrar igualmente?`)) return;
-  const label = vLabel(v);
-  g.repostajes.push({ uid:uid(), vid:v.id, label, importe, litros, km, obs, ts:Date.now() });
-  evento('REPOSTAJE', label, { importe, litros, km, obs }, g.id);
-  if(S.ultimoKm[v.id] == null || km > S.ultimoKm[v.id]) S.ultimoKm[v.id] = km;
-  persist(); renderRepostaje(); renderFinal(); toast(`Repostaje de ${fEur(importe)} registrado`, 'ok'); sync();
+const tandaOf = el => { const c = el.closest('.tanda'); return c && openTandas(S.guardia).find(t => t.id === c.dataset.tid); };
+function readKm(cls){
+  const rows = []; let bajos = [];
+  $$('#tab-repostaje .' + cls).forEach(inp => {
+    const km = parseKm(inp.value); if(km == null) return;
+    const id = inp.dataset.vid, ini = S.guardia.inicio[id], ref = kmRef(id);
+    if(ref != null && km < ref) bajos.push(`${ini.label}: ${fKm(km)} (último ${fKm(ref)})`);
+    rows.push({ vid:id, label:ini.label, km, ts:Date.now() });
+  });
+  if(!rows.length){ toast('Indica los km de al menos un vehículo', 'ko'); return null; }
+  if(bajos.length && !confirm('Km menores que el último registrado:\n' + bajos.join('\n') + '\n\n¿Continuar?')) return null;
+  return rows;
+}
+function tandaNew(){
+  const rows = readKm('km-new'); if(!rows) return;
+  const g = S.guardia; g.tandas = g.tandas || [];
+  g.tandas.push({ id:uid(), ts:Date.now(), items:rows });
+  persist(); renderRepostaje(); toast('Km guardados · copia la nota para la preautorización', 'ok');
+}
+function tandaAdd(t){
+  const rows = readKm('km-add'); if(!rows) return;
+  t.items.push(...rows); persist(); renderRepostaje(); toast('Vehículo añadido al repostaje', 'ok');
+}
+function tandaInput(inp){
+  const t = tandaOf(inp), it = t && t.items.find(x => x.vid === inp.closest('.titem').dataset.vid); if(!it) return;
+  if(inp.classList.contains('t-km')) it.km = parseKm(inp.value);
+  if(inp.classList.contains('t-imp')){ it.impTxt = inp.value; it.importe = parseDec(inp.value); }
+  if(inp.classList.contains('t-lit')){ it.litTxt = inp.value; it.litros = parseDec(inp.value); }
+  const c = inp.closest('.tanda');
+  $('.t-total', c).textContent = fEur(t.items.reduce((a, x) => a + (x.importe || 0), 0));
+  if(inp.classList.contains('t-km')) $('.nota pre', c).textContent = notaText(t);
+  persist();
+}
+function tandaSend(t){
+  const c = $(`.tanda[data-tid="${t.id}"]`); let err = 0;
+  t.items.forEach(x => {
+    const row = $(`.titem[data-vid="${x.vid}"]`, c);
+    const bImp = !(x.importe > 0), bKm = x.km == null;
+    $('.t-imp', row).classList.toggle('invalid', bImp); $('.t-km', row).classList.toggle('invalid', bKm);
+    if(bImp || bKm) err++;
+  });
+  if(err){ toast('Falta importe o km. Si un vehículo no repostó, quítalo con ✕', 'ko'); return; }
+  const g = S.guardia, now = Date.now();
+  t.items.forEach(x => {
+    const obs = 'Km tomados ' + hora(x.ts);
+    g.repostajes.push({ uid:uid(), vid:x.vid, label:x.label, importe:x.importe, litros:x.litros ?? null, km:x.km, obs, ts:now });
+    evento('REPOSTAJE', x.label, { importe:x.importe, litros:x.litros ?? null, km:x.km, obs }, g.id);
+    if(S.ultimoKm[x.vid] == null || x.km > S.ultimoKm[x.vid]) S.ultimoKm[x.vid] = x.km;
+  });
+  const tot = t.items.reduce((a, x) => a + x.importe, 0);
+  g.tandas = g.tandas.filter(x => x !== t);
+  persist(); renderRepostaje(); renderFinal(); toast(`Repostaje de ${fEur(tot)} registrado`, 'ok');
+  sync(true);
+}
+async function copyText(txt){
+  try{ await navigator.clipboard.writeText(txt); toast('Nota copiada', 'ok'); return; }catch(e){}
+  const ta = document.createElement('textarea'); ta.value = txt; ta.setAttribute('readonly', ''); ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta); ta.select(); ta.setSelectionRange(0, txt.length);
+  try{ document.execCommand('copy'); toast('Nota copiada', 'ok'); }catch(e){ toast('No se pudo copiar', 'ko'); }
+  ta.remove();
+}
+function tickTandas(){
+  const g = S.guardia; if(!g) return;
+  const act = activeTanda(g);
+  if((act ? act.id : null) !== draft.activeTid){ renderRepostaje(); renderFinal(); return; }
+  openTandas(g).forEach(t => { const b = $(`[data-tbadge="${t.id}"]`); if(b) b.outerHTML = tandaBadge(t); });
 }
 
 /* ---------- FINAL ---------- */
@@ -355,7 +476,8 @@ function renderFinal(){
       <div class="stats"><div><small>Km inicio</small><b>${fKm(i.km)}</b></div><div><small>Recorridos</small><b class="rec">—</b></div></div>
       <label class="field"><span>Km finales</span><input name="km" inputmode="numeric" pattern="[0-9]*" autocomplete="off" placeholder="${ref != null ? 'Último: ' + fKm(ref) : 'Km'}"></label></div>`;
   });
-  const reps = g.repostajes, tot = reps.reduce((a, r) => a + (r.importe || 0), 0);
+  const reps = g.repostajes, tot = reps.reduce((a, r) => a + (r.importe || 0), 0), pend = openTandas(g).length;
+  if(pend) h += `<div class="note info">⚠ Hay un repostaje abierto sin importe (se borra en ${minsLeft(openTandas(g)[0])} min). <a href="#" data-act="go" data-tab="repostaje">Completar</a></div>`;
   h += `<div class="card"><div class="stats" style="margin:0"><div><small>Repostajes</small><b>${reps.length}</b></div><div><small>Total</small><b>${fEur(tot)}</b></div></div></div>
     <button class="btn" data-act="close">Cerrar guardia</button>`;
   el.innerHTML = h;
@@ -374,7 +496,9 @@ function closeGuardia(){
     rows.push({ id, ini, km });
   });
   if(err){ toast('Revisa los km finales (vacíos o menores que los de inicio)', 'ko'); return; }
-  if(!confirm(`¿Cerrar la guardia del ${fFecha(g.id)}?`)) return;
+  const pend = openTandas(g).length;
+  if(!confirm((pend ? '⚠ Hay un repostaje abierto sin importe que NO se enviará.\n\n' : '') + `¿Cerrar la guardia del ${fFecha(g.id)}?`)) return;
+  g.tandas = [];
   rows.forEach(r => {
     const rec = r.km != null && r.ini != null ? r.km - r.ini : null;
     g.final[r.id] = { km:r.km, recorridos:rec, ts:Date.now() };
@@ -542,10 +666,18 @@ document.addEventListener('click', e => {
       $$('.seg button', f).forEach(x => x.className = x === b ? (b.dataset.v === '1' ? 'on-ok' : 'on-ko') : ''); break; }
     case 'save-ini': saveInicio(); break;
     case 'corr-ini': draft.editInicio[b.dataset.id] = true; renderInicio(); break;
-    case 'rep-veh': draft.repVeh = b.dataset.id;
-      $$('#tab-repostaje .chip').forEach(c => c.classList.toggle('on', c === b));
-      { const ref = kmRef(b.dataset.id); $('#r-km').placeholder = ref != null ? 'Último: ' + fKm(ref) : 'Km'; } break;
-    case 'save-rep': saveRepostaje(); break;
+    case 'tanda-new': tandaNew(); break;
+    case 'tanda-add': { const t = tandaOf(b); if(t) tandaAdd(t); break; }
+    case 'copy-nota': { const t = tandaOf(b); if(t) copyText(notaText(t)); break; }
+    case 'tanda-send': { const t = tandaOf(b); if(t) tandaSend(t); break; }
+    case 'tanda-rm': { const t = tandaOf(b), vid = b.closest('.titem').dataset.vid, it = t && t.items.find(x => x.vid === vid);
+      if(!it || !confirm(`¿Quitar ${it.label} de este repostaje?`)) break;
+      t.items = t.items.filter(x => x !== it);
+      if(!t.items.length) S.guardia.tandas = S.guardia.tandas.filter(x => x !== t);
+      persist(); renderRepostaje(); break; }
+    case 'tanda-discard': { const t = tandaOf(b);
+      if(t && confirm('¿Descartar este repostaje? Los km anotados se perderán y no se enviará nada.')){
+        S.guardia.tandas = S.guardia.tandas.filter(x => x !== t); persist(); renderRepostaje(); toast('Repostaje descartado'); } break; }
     case 'close': closeGuardia(); break;
     case 'share-cur': shareTxt(`Parte_${S.guardia.id}.txt`, buildTxt(S.guardia)); break;
     case 'share-hist': { const g = S.historial[+b.dataset.i]; shareTxt(`Parte_${g.id}.txt`, buildTxt(g)); break; }
@@ -576,10 +708,12 @@ document.addEventListener('click', e => {
 document.addEventListener('input', e => {
   if(e.target.classList.contains('invalid')) e.target.classList.remove('invalid');
   const f = e.target.closest('.fin-form'); if(f) updateRec(f);
+  if(e.target.closest('.titem')) tandaInput(e.target);
 });
+setInterval(tickTandas, 30000);
 window.addEventListener('online', () => sync());
 window.addEventListener('offline', renderStatus);
-document.addEventListener('visibilitychange', () => { if(document.visibilityState === 'visible') sync(); });
+document.addEventListener('visibilitychange', () => { if(document.visibilityState === 'visible'){ tickTandas(); sync(); } });
 setInterval(() => { if(S.cola.length) sync(); }, 60000);
 
 renderAll();
